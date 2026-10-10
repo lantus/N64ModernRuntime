@@ -178,7 +178,6 @@ extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 ret
 
 uint64_t total_vis = 0;
 
-static const bool g_ai_legacy = std::getenv("TWINE_AI_LEGACY") != nullptr;
 
 extern std::atomic_bool exited;
 extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
@@ -210,15 +209,12 @@ void vi_thread_func() {
             // printf("Skipping the next VI wait\n");
             next = std::chrono::high_resolution_clock::now();
         }
-        if (!g_ai_legacy && ultramodern::is_game_started()) {
+        if (ultramodern::is_game_started()) {
             auto halfperiod = (500000us) / (60 * ultramodern::get_speed_multiplier());
             auto mid = next - halfperiod;
             if (mid > std::chrono::high_resolution_clock::now()) {
                 ultramodern::sleep_until(mid);
-                static const uint32_t lowwater_vis = [] {
-                    const char* v = std::getenv("TWINE_AI_LOWWATER");
-                    return v ? (uint32_t)atoi(v) : 8u;
-                }();
+                constexpr uint32_t lowwater_vis = 8;   // ~130 ms of audio
                 uint32_t remaining = ultramodern::get_remaining_audio_bytes();
                 uint32_t vi_bytes = (ultramodern::get_audio_frequency() / 60) * 2 * sizeof(int16_t);
                 if (remaining < lowwater_vis * vi_bytes) {
@@ -267,26 +263,8 @@ void vi_thread_func() {
                 remaining_retraces = cur_state->retrace_count;
             }
             if (events_context.ai.mq != NULLPTR) {
-                int ai_events = 1;
-                if (g_ai_legacy) {
-                    static const int forced = [] {
-                        const char* v = std::getenv("TWINE_AI_EVENTS");
-                        return v ? atoi(v) : 0;
-                    }();
-                    if (forced > 0) {
-                        ai_events = forced;
-                    } else {
-                        uint32_t remaining_bytes = ultramodern::get_remaining_audio_bytes();
-                        uint32_t vi_bytes = (ultramodern::get_audio_frequency() / 60) * 2 * sizeof(int16_t);
-                        if (remaining_bytes < 3 * vi_bytes) {
-                            ai_events = 3;
-                        }
-                    }
-                }
-                for (int ai_event = 0; ai_event < ai_events; ai_event++) {
-                    // Send a message to the AI queue, and do not set it to be requeued if the queue was full for the same reason as the VI message above.
-                    ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
-                }
+                // Send a message to the VI queue, and do not set it to be requeued if the queue was full for the same reason as the VI message above.
+                ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
             }
         }
 
@@ -419,12 +397,6 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 renderer_context->send_dl(&task_action->task);
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 
-                if (getenv("TWINE_LOG_GFX")) {
-                    double ms = std::chrono::duration<double, std::milli>(renderer_end - renderer_start).count();
-                    static double thr = []{ const char* v = getenv("TWINE_GFX_MS"); return v ? atof(v) : 15.0; }();
-                    if (ms > thr) { printf("[GFX] send_dl %.1f ms\n", ms); fflush(stdout); }
-                }
-
                 dp_complete();
                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
                 ultramodern::extensions::on_displaylist_parsed(displaylist);
@@ -435,11 +407,6 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 events_context.vi.update_screen_regs = screen_update_action->regs;
                 [[maybe_unused]] auto us_start = std::chrono::high_resolution_clock::now();
                 renderer_context->update_screen();
-                if (getenv("TWINE_LOG_GFX")) {
-                    double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - us_start).count();
-                    static double thr = []{ const char* v = getenv("TWINE_GFX_MS"); return v ? atof(v) : 15.0; }();
-                    if (ms > thr) { printf("[GFX] update_screen %.1f ms\n", ms); fflush(stdout); }
-                }
                 display_refresh_rate = renderer_context->get_display_framerate();
                 resolution_scale = renderer_context->get_resolution_scale();
             }
