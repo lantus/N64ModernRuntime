@@ -119,6 +119,7 @@ void trigger_config_action();
 // Audio
 void init_audio();
 void set_audio_frequency(uint32_t freq);
+uint32_t get_audio_frequency();
 void queue_audio_buffer(RDRAM_ARG PTR(s16) audio_data, uint32_t byte_count);
 uint32_t get_remaining_audio_bytes();
 

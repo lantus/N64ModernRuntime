@@ -15,6 +15,10 @@ void ultramodern::init_audio() {
     set_audio_frequency(48000);
 }
 
+uint32_t ultramodern::get_audio_frequency() {
+    return sample_rate;
+}
+
 void ultramodern::set_audio_frequency(uint32_t freq) {
     if (audio_callbacks.set_frequency) {
         audio_callbacks.set_frequency(freq);

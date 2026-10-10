@@ -8,6 +8,7 @@
 #include "librecomp/addresses.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/files.hpp"
+#include "librecomp/overlays.hpp"
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
 
@@ -266,6 +267,10 @@ void ultramodern::join_saving_thread() {
     }
 }
 
+// Defined in overlays.cpp: hands the RDRAM pointer to the overlay loader so it
+// can apply data relocations to freshly DMA'd overlay bytes.
+extern "C" void twine_overlays_set_rdram(uint8_t* rdram);
+
 void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
     // TODO asynchronous transfer
     // TODO implement unaligned DMA correctly
@@ -273,6 +278,14 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
         if (physical_addr >= recomp::rom_base) {
             // read cart rom
             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
+
+            // Relocatable overlays: if this ROM->RAM DMA copied an overlay code section,
+            // (re)register its functions at the actual load address so indirect calls into
+            // the overlay resolve, and apply the section's data relocations to the bytes
+            // this DMA carried. load_overlays() self-filters by ROM range, so this is a
+            // no-op for asset/data DMAs that don't overlap any code section.
+            twine_overlays_set_rdram(rdram);
+            load_overlays(physical_addr - recomp::rom_base, (int32_t)rdram_address, size);
 
             // Send a message to the mq to indicate that the transfer completed
             ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);

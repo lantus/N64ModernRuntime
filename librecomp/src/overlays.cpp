@@ -1,8 +1,11 @@
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ultramodern/ultramodern.hpp"
@@ -150,8 +153,131 @@ void recomp::overlays::add_loaded_function(int32_t ram, recomp_func_t* func) {
     func_map[ram] = func;
 }
 
+// RDRAM pointer captured from the DMA path (librecomp keeps rdram out of the
+// overlay API, so the harness pi.cpp hands it to us before calling
+// load_overlays).
+static uint8_t* overlay_rdram = nullptr;
+
+extern "C" void twine_overlays_set_rdram(uint8_t* rdram) {
+    overlay_rdram = rdram;
+}
+
+// 32-bit word access with the same address arithmetic as MEM_W (KSEG0/KSEG1
+// virtual address -> byte offset into the rdram allocation; words are stored
+// at their natural offsets in host endianness).
+static inline uint32_t rdram_word_read(uint32_t vram) {
+    return *(uint32_t*)(overlay_rdram + (vram & 0x1FFFFFFFu));
+}
+
+static inline void rdram_word_write(uint32_t vram, uint32_t value) {
+    *(uint32_t*)(overlay_rdram + (vram & 0x1FFFFFFFu)) = value;
+}
+
+static bool overlays_log_enabled() {
+    static bool enabled = getenv("TWINE_LOG_OVERLAYS") != nullptr;
+    return enabled;
+}
+
+// Applies the relocs of one loaded section that fall inside the RAM window
+// [dma_ram, dma_ram + dma_size) that a DMA just filled.
+static void apply_relocs_in_dma_range(const LoadedSection& loaded, uint32_t dma_ram, uint32_t dma_size) {
+    const SectionTableEntry& section = sections_info.code_sections[loaded.section_table_index];
+    if (overlay_rdram == nullptr || section.relocs == nullptr || section.num_relocs == 0) {
+        return;
+    }
+
+    uint32_t loaded_addr = (uint32_t)loaded.loaded_ram_addr;
+
+    // Intersect the DMA window with the section's loaded range.
+    uint32_t lo = std::max(dma_ram, loaded_addr);
+    uint32_t hi = std::min(dma_ram + dma_size, loaded_addr + section.size);
+    if (lo >= hi) {
+        return;
+    }
+
+    size_t applied = 0;
+    for (size_t i = 0; i < section.num_relocs; i++) {
+        const RelocEntry& reloc = section.relocs[i];
+        uint32_t word_vram = loaded_addr + reloc.offset;
+        // Only patch words whose bytes were carried by this DMA; earlier pages
+        // were patched by earlier calls, later pages will be patched when they
+        // arrive (a later DMA of the same page would overwrite our patch with
+        // raw ROM bytes, so per-window application is also what keeps re-DMAs
+        // correct).
+        if (word_vram < lo || word_vram + 4 > hi) {
+            continue;
+        }
+        // An address of 0 means the target section was never registered in
+        // section_addresses (init_overlays only fills sections present in the
+        // section table) - patching against it would produce garbage.
+        uint32_t target_section_addr = (uint32_t)section_addresses[reloc.target_section];
+        if (target_section_addr == 0) {
+            continue;
+        }
+        uint32_t target = target_section_addr + reloc.target_section_offset;
+
+        uint32_t word = rdram_word_read(word_vram);
+        uint32_t patched = word;
+        switch (reloc.type) {
+            case R_MIPS_32:
+                patched = target;
+                break;
+            case R_MIPS_26:
+                patched = (word & 0xFC000000u) | ((target & 0x0FFFFFFFu) >> 2);
+                break;
+            case R_MIPS_HI16:
+                patched = (word & 0xFFFF0000u) | ((uint32_t)HI16(target) & 0xFFFFu);
+                break;
+            case R_MIPS_LO16:
+                patched = (word & 0xFFFF0000u) | ((uint32_t)LO16(target) & 0xFFFFu);
+                break;
+            default:
+                continue;
+        }
+        if (patched != word) {
+            rdram_word_write(word_vram, patched);
+            applied++;
+        }
+    }
+
+    if (applied != 0 && overlays_log_enabled()) {
+        fprintf(stderr, "[OVL] applied %zu reloc(s) for section %zu (rom 0x%06X) in RAM window 0x%08X-0x%08X\n",
+                applied, loaded.section_table_index, section.rom_addr, lo, hi);
+    }
+}
+
+// The game reuses one shared RAM slot (~0x80117740) for its 16 game-mode
+// overlays and never explicitly unloads the previous one. Loading a new
+// section over a stale one must evict the stale entry: its func_map entries
+// would shadow/leak, and worse, its reloc table would get applied to the NEW
+// overlay's freshly DMA'd bytes.
+static void evict_overlapping_sections(uint32_t new_addr, uint32_t new_size) {
+    for (auto it = loaded_sections.begin(); it != loaded_sections.end();) {
+        const SectionTableEntry& section = sections_info.code_sections[it->section_table_index];
+        uint32_t old_addr = (uint32_t)it->loaded_ram_addr;
+
+        if (new_addr < old_addr + section.size && new_addr + new_size > old_addr) {
+            for (size_t func_index = 0; func_index < section.num_funcs; func_index++) {
+                const FuncEntry& func = section.funcs[func_index];
+                func_map.erase(it->loaded_ram_addr + (int32_t)func.offset);
+            }
+            section_addresses[section.index] = section.ram_addr;
+            if (overlays_log_enabled()) {
+                fprintf(stderr, "[OVL] evicted section %zu (rom 0x%06X) from 0x%08X\n",
+                        it->section_table_index, section.rom_addr, old_addr);
+            }
+            it = loaded_sections.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
 void load_overlay(size_t section_table_index, int32_t ram) {
     const SectionTableEntry& section = sections_info.code_sections[section_table_index];
+
+    // Drop any stale section still registered in this RAM range.
+    evict_overlapping_sections((uint32_t)ram, section.size);
 
     for (size_t function_index = 0; function_index < section.num_funcs; function_index++) {
         const FuncEntry& func = section.funcs[function_index];
@@ -160,6 +286,12 @@ void load_overlay(size_t section_table_index, int32_t ram) {
 
     loaded_sections.emplace_back(ram, section_table_index);
     section_addresses[section.index] = ram;
+
+    if (overlays_log_enabled()) {
+        fprintf(stderr, "[OVL] section %zu (rom 0x%06X) loaded at 0x%08X (link 0x%08X, delta %+d), %zu reloc(s)\n",
+                section_table_index, section.rom_addr, (uint32_t)ram, section.ram_addr,
+                (int)(ram - (int32_t)section.ram_addr), section.num_relocs);
+    }
 }
 
 static void load_special_overlay(const SectionTableEntry& section, int32_t ram) {
@@ -186,21 +318,37 @@ void recomp::overlays::read_patch_data(uint8_t* rdram, gpr patch_data_address) {
 }
 
 extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
-    // Search for the first section that's included in the loaded rom range
-    // Sections were sorted by `init_overlays` so we can use the bounds functions
-    auto lower = std::lower_bound(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections], rom,
-        [](const SectionTableEntry& entry, uint32_t addr) {
-            return entry.rom_addr < addr;
+    // Register any code section whose FIRST byte is carried by this ROM->RAM DMA.
+    // Relocatable overlays are DMA'd in 4KB pages, so a section spans many DMAs — but we
+    // only need the chunk containing the section's start to know its load address; every
+    // function in the section is at (that ram address) + (function offset). Linear scan
+    // over the (small) section table; self-filters to a no-op for non-overlay DMAs.
+    for (size_t i = 0; i < sections_info.num_code_sections; i++) {
+        const SectionTableEntry& section = sections_info.code_sections[i];
+        if (section.rom_addr >= rom && section.rom_addr < (uint64_t)rom + size) {
+            load_overlay(i, ram_addr + (int32_t)(section.rom_addr - rom));
         }
-    );
-    auto upper = std::upper_bound(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections], (uint32_t)(rom + size),
-        [](uint32_t addr, const SectionTableEntry& entry) {
-            return addr < entry.size + entry.rom_addr;
+    }
+
+    // Overlay data relocation: patch every reloc whose target word was carried
+    // by this DMA, for every loaded section this DMA's RAM window touches.
+    // This covers both the section registered just above (its first page) and
+    // sections registered by earlier DMAs (their later 4KB pages).
+    for (const LoadedSection& loaded : loaded_sections) {
+        apply_relocs_in_dma_range(loaded, (uint32_t)ram_addr, size);
+    }
+
+    // Diagnostic: watch for ROM DMAs into the BSS tail below the overlay slot
+    // (0x80117000..0x80117740) - the region the game jumps into at speech
+    // start. If the speech handler blob is DMA'd raw from ROM, this reveals
+    // its ROM source so it can be recompiled and registered.
+    if (getenv("TWINE_LOG_MISSING") || overlays_log_enabled()) {
+        uint32_t lo = 0x80117000, hi = 0x80117740;
+        uint32_t a = (uint32_t)ram_addr;
+        if (a < hi && a + size > lo) {
+            fprintf(stderr, "[OVL] DMA into BSS tail: rom=0x%06X -> ram=0x%08X size=0x%X\n",
+                    rom, a, size);
         }
-    );
-    // Load the overlays that were found
-    for (auto it = lower; it != upper; ++it) {
-        load_overlay(std::distance(&sections_info.code_sections[0], it), it->rom_addr - rom + ram_addr);
     }
 }
 
@@ -361,9 +509,110 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
     return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
 }
 
+static void missing_func_stub(uint8_t*, recomp_context*) {}
+
+constexpr size_t MAX_CHAIN_THUNKS = 64;
+static int32_t chain_addrs[MAX_CHAIN_THUNKS];
+static size_t num_chain_thunks = 0;
+static std::unordered_map<int32_t, recomp_func_t*> chain_thunks_by_addr;
+
+static void chain_dispatch(uint8_t* rdram, recomp_context* ctx, size_t slot) {
+    int32_t addr = chain_addrs[slot];
+    uint32_t stored = *(uint32_t*)(rdram + ((uint32_t)addr & 0x1FFFFFFFu));
+
+    static std::unordered_map<int32_t, int> logged;
+    // Caller identification: at call time $ra holds the return address, i.e.
+    // the instruction right after the jalr that jumped here. This pins down
+    // the exact calling function in the recompiled sources.
+    if (logged[addr]++ == 0) {
+        if (ctx != nullptr) {
+            fprintf(stderr, "[MISSING-CALL] target=0x%08X word@target=0x%08X caller_ra=0x%08X args a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X\n",
+                    (uint32_t)addr, stored, (uint32_t)ctx->r31,
+                    (uint32_t)ctx->r4, (uint32_t)ctx->r5, (uint32_t)ctx->r6, (uint32_t)ctx->r7);
+        } else {
+            fprintf(stderr, "[MISSING-CALL] target=0x%08X word@target=0x%08X (no context)\n", (uint32_t)addr, stored);
+        }
+
+        // One-shot RDRAM dump of the mystery BSS-tail regions: the apparent
+        // caller neighborhood and the jump-target table. If runtime-copied
+        // CODE lives there, these words will decode as MIPS and can be
+        // matched against the ROM/assets to find their source.
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            auto dump = [&](uint32_t start, uint32_t end, const char* label) {
+                fprintf(stderr, "[DUMP] %s (0x%08X..0x%08X):\n", label, start, end);
+                for (uint32_t a = start; a < end; a += 16) {
+                    fprintf(stderr, "[DUMP]   0x%08X: %08X %08X %08X %08X\n", a,
+                            rdram_word_read(a), rdram_word_read(a + 4),
+                            rdram_word_read(a + 8), rdram_word_read(a + 12));
+                }
+            };
+            dump(0x80117180, 0x80117280, "caller region");
+            dump(0x80117380, 0x80117400, "target table region");
+        }
+    }
+
+    static bool chain_enabled = getenv("TWINE_CHAIN_MISSING") != nullptr;
+    if (chain_enabled) {
+        auto it = func_map.find((int32_t)stored);
+        if (it != func_map.end()) {
+            fprintf(stderr, "[CHAIN] 0x%08X -> word 0x%08X (known function, dispatching)\n", (uint32_t)addr, stored);
+            it->second(rdram, ctx);
+        }
+    }
+}
+
+template <size_t... Is>
+static constexpr std::array<recomp_func_t*, sizeof...(Is)> make_chain_table(std::index_sequence<Is...>) {
+    return { +[](uint8_t* rdram, recomp_context* ctx) { chain_dispatch(rdram, ctx, Is); }... };
+}
+
+static recomp_func_t* get_chain_thunk(int32_t addr) {
+    auto find_it = chain_thunks_by_addr.find(addr);
+    if (find_it != chain_thunks_by_addr.end()) {
+        return find_it->second;
+    }
+    static const std::array<recomp_func_t*, MAX_CHAIN_THUNKS> chain_table =
+        make_chain_table(std::make_index_sequence<MAX_CHAIN_THUNKS>{});
+    if (num_chain_thunks >= MAX_CHAIN_THUNKS) {
+        return missing_func_stub;
+    }
+    size_t slot = num_chain_thunks++;
+    chain_addrs[slot] = addr;
+    recomp_func_t* thunk = chain_table[slot];
+    chain_thunks_by_addr.emplace(addr, thunk);
+    return thunk;
+}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
+        if (getenv("TWINE_LOG_MISSING")) {
+            static std::unordered_map<int32_t,int> seen;
+            if (seen[addr]++ == 0) {
+                fprintf(stderr, "[MISSING] 0x%08X", (uint32_t)addr);
+                // Context: is the address inside a loaded overlay section?
+                for (const LoadedSection& s : loaded_sections) {
+                    const SectionTableEntry& section = sections_info.code_sections[s.section_table_index];
+                    uint32_t base = (uint32_t)s.loaded_ram_addr;
+                    if ((uint32_t)addr >= base && (uint32_t)addr < base + section.size) {
+                        fprintf(stderr, " (in section %zu rom 0x%06X, offset +0x%X, link 0x%08X, delta %+d)",
+                                s.section_table_index, section.rom_addr, (uint32_t)addr - base,
+                                section.ram_addr, (int)(s.loaded_ram_addr - (int32_t)section.ram_addr));
+                    }
+                }
+                // What is stored AT the address right now? (If it's a known
+                // function pointer, this is a jump-to-pointer-table-slot.)
+                if (overlay_rdram != nullptr) {
+                    uint32_t stored = rdram_word_read((uint32_t)addr);
+                    fprintf(stderr, " word@addr=0x%08X%s", stored,
+                            func_map.count((int32_t)stored) ? " (a known function!)" : "");
+                }
+                fprintf(stderr, "\n");
+            }
+            return get_chain_thunk(addr);
+        }
         fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
         assert(false);
         std::exit(EXIT_FAILURE);
